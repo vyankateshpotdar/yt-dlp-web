@@ -1,0 +1,162 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>YT Downloader (Turnstile demo)</title>
+  <style>body{font-family:system-ui, sans-serif; max-width:900px;margin:2rem auto;padding:1rem}</style>
+
+  <!-- Cloudflare Turnstile client -->
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+</head>
+<body>
+  <h1>YT Downloader (demo)</h1>
+
+  <label>Video URL</label>
+  <input id="url" placeholder="Paste YouTube URL" style="width:100%" />
+  <br/><br/>
+  <button id="infoBtn">Get formats</button>
+
+  <div id="meta"></div>
+
+  <!-- Invisible Turnstile container -->
+  <div id="cf-turnstile" style="display:none"></div>
+
+  <script>
+    // Replace with your backend API base (https)
+    const apiBase = "https://YOUR_BACKEND_DOMAIN_OR_IP"; // e.g. https://api.example.com
+
+    // Replace with your site key configured in Netlify env or set here for local dev
+    const SITE_KEY = "YOUR_TURNSTILE_SITEKEY";
+
+    // Render an invisible Turnstile widget and keep its widgetId
+    let widgetId = null;
+    function renderTurnstile() {
+      if (typeof turnstile === "undefined") {
+        console.warn("Turnstile script not loaded yet.");
+        return;
+      }
+      // render once into #cf-turnstile
+      widgetId = turnstile.render('#cf-turnstile', {
+        sitekey: SITE_KEY,
+        size: 'invisible', // invisible widget
+        callback: (token) => {
+          // token received after execute()
+          // token is handed back to the caller via a Promise in execTurnstile()
+          if (pendingResolve) {
+            pendingResolve(token);
+            pendingResolve = null;
+          }
+        },
+        "error-callback": () => {
+          if (pendingReject) {
+            pendingReject(new Error("Turnstile error"));
+            pendingReject = null;
+          }
+        }
+      });
+    }
+    // Poll until widget is available then render
+    const tryRender = setInterval(() => {
+      if (typeof turnstile !== "undefined") {
+        clearInterval(tryRender);
+        renderTurnstile();
+      }
+    }, 200);
+
+    // helper: execute and get token as Promise
+    let pendingResolve = null;
+    let pendingReject = null;
+    function execTurnstile() {
+      return new Promise((resolve, reject) => {
+        if (!widgetId) {
+          return reject(new Error("Turnstile widget not ready"));
+        }
+        pendingResolve = resolve;
+        pendingReject = reject;
+        try {
+          turnstile.execute(widgetId);
+        } catch (err) {
+          pendingResolve = null;
+          pendingReject = null;
+          reject(err);
+        }
+      });
+    }
+
+    // fetch formats (calls /api/info with token)
+    document.getElementById("infoBtn").onclick = async () => {
+      const url = document.getElementById("url").value;
+      if (!url) return alert("Add URL");
+
+      let token;
+      try {
+        token = await execTurnstile();
+      } catch (e) {
+        return alert("Captcha failed: " + e.message);
+      }
+
+      const params = new URLSearchParams({ url, "cf-turnstile-response": token });
+      const res = await fetch(apiBase + "/api/info?" + params.toString(), {
+        headers: {
+          // Or you can use "X-Turnstile-Token": token
+          // "X-Turnstile-Token": token,
+        }
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        return alert("Error: " + res.status + " " + text);
+      }
+      const json = await res.json();
+      document.getElementById("meta").innerHTML = `
+        <h2>${json.title}</h2>
+        <img src="${json.thumbnail}" width="360" />
+        <h3>Formats</h3>
+        <ul>${json.formats.map(f => `<li>
+          ${f.format_id} — ${f.ext} — ${f.vcodec || ''} ${f.acodec || ''} ${f.height ? f.height+'p':''}
+          <a href="${apiBase + '/api/download?url=' + encodeURIComponent(document.getElementById('url').value) + '&format_id=' + encodeURIComponent(f.format_id) + '&type=mp4'}" class="dl">Download MP4</a>
+          |
+          <a href="${apiBase + '/api/download?url=' + encodeURIComponent(document.getElementById('url').value) + '&format_id=' + encodeURIComponent(f.format_id) + '&type=mp3'}" class="dl">Download MP3</a>
+        </li>`).join('')}</ul>
+      `;
+      // Attach click handlers to download links to ensure Turnstile token is used on download too
+      document.querySelectorAll(".dl").forEach(a => {
+        a.addEventListener("click", async (ev) => {
+          ev.preventDefault();
+          const href = a.href;
+          try {
+            const t = await execTurnstile();
+            // send token in header for the download request and open result in new tab
+            // We fetch the URL and create a blob download to preserve token in header
+            const downloadRes = await fetch(href + "&cf-turnstile-response=" + encodeURIComponent(t), {
+              method: "GET",
+              // Alternatively: headers: { "X-Turnstile-Token": t }
+            });
+            if (!downloadRes.ok) {
+              const txt = await downloadRes.text();
+              return alert("Download error: " + downloadRes.status + " " + txt);
+            }
+            const blob = await downloadRes.blob();
+            const dlUrl = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = dlUrl;
+            // Try to extract filename from Content-Disposition
+            const cd = downloadRes.headers.get("Content-Disposition");
+            let fname = "download";
+            if (cd) {
+              const m = cd.match(/filename="?(.*?)"?$/);
+              if (m) fname = m[1];
+            }
+            link.download = fname;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(dlUrl);
+          } catch (err) {
+            alert("Download failed: " + err.message);
+          }
+        });
+      });
+    };
+  </script>
+</body>
+</html>
